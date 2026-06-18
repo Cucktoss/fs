@@ -9,8 +9,10 @@
 VFS-помощников ядра (`libfs`/simple_*). Модуль:
 
 * регистрирует `struct file_system_type` через `register_filesystem()`;
-* монтируется без устройства через `mount_nodev()` + `u235fs_fill_super()`;
-* очищается через `kill_litter_super()` (с предварительной остановкой работы);
+* монтируется без устройства через `get_tree_nodev()` + `u235fs_fill_super()` (ядро
+  6.8+) или через `mount_nodev()` + `u235fs_fill_super()` (ядро < 6.8);
+* очищается через `kill_anon_super()` (ядро 6.8+) или `kill_litter_super()` (ядро
+  < 6.8) с предварительной остановкой работы;
 * хранит всё состояние симуляции в одной структуре `struct u235_sim`,
   закреплённой за суперблоком (`sb->s_fs_info`);
 * отображает виртуальные файлы, содержимое которых генерируется при чтении из
@@ -47,15 +49,21 @@ struct u235_sim {
 
 ## 3. Жизненный цикл mount / unmount
 
-**mount:**
-1. `u235fs_mount()` → `mount_nodev(..., u235fs_fill_super)`.
-2. `u235fs_fill_super()` задаёт `s_magic`, `s_op`, выделяет `struct u235_sim`
+**mount (ядро 6.8+):**
+1. VFS вызывает `u235fs_init_fs_context()`, которая регистрирует таблицу
+   `u235fs_ctx_ops`.
+2. VFS вызывает `u235fs_get_tree()` → `get_tree_nodev(..., u235fs_fill_super)`.
+3. `u235fs_fill_super()` задаёт `s_magic`, `s_op`, выделяет `struct u235_sim`
    (`kzalloc`), инициализирует mutex и `delayed_work`, заполняет параметры по
    умолчанию, создаёт корневой inode (`d_make_root`) и файл `PARAMS`.
 
+**mount (ядро < 6.8):**
+1. `u235fs_mount()` → `mount_nodev(..., u235fs_fill_super_legacy)`.
+2. `u235fs_fill_super_legacy()` является переходником к `u235fs_fill_super()`.
+
 **unmount / rmmod:**
 * `kill_sb` (`u235fs_kill_sb`) сначала вызывает `cancel_delayed_work_sync()`,
-  затем `kill_litter_super()` (освобождает все закреплённые dentry/inode) и
+  затем `kill_anon_super()` (ядро 6.8+) или `kill_litter_super()` (ядро < 6.8) и
   `kfree(sim)`.
 * Пока ФС смонтирована, счётчик ссылок модуля удерживается
   (`file_system_type.owner = THIS_MODULE`), поэтому `rmmod` при смонтированной ФС
@@ -64,11 +72,12 @@ struct u235_sim {
 ## 4. Как создаются файлы
 
 Файлы создаются как пары inode+dentry в dcache:
-* `u235fs_make_inode()` — `new_inode()`, режим, владелец, времена
-  (`simple_inode_init_ts` на 6.6+, иначе прямое присваивание), тип в `i_private`,
-  назначение `i_op`/`i_fop`.
+* `u235fs_make_inode()` — `new_inode()`, режим, владелец, времена (через
+  `inode_set_atime_to_ts` / `inode_set_mtime_to_ts` / `inode_set_ctime_to_ts` на
+  ядре 6.6+, иначе прямое присваивание полей `i_atime`/`i_mtime`/`i_ctime`), тип
+  в `i_private`, назначение `i_op`/`i_fop`.
 * `u235fs_add_file()` — `d_alloc_name()` + `d_add()`. Удерживаемая ссылка
-  закрепляет файл на время жизни ФС; `kill_litter_super()` корректно их освободит.
+  закрепляет файл на время жизни ФС.
 
 `PARAMS` создаётся при `fill_super`. Файлы состояния (`TEMPERATURE`,
 `DECAYED_NUCLEI`, `DECAY_RATE`, `ELAPSED_TIME`, `STATE`) создаются один раз — при
@@ -78,6 +87,12 @@ struct u235_sim {
 `readdir` (`ls`) обслуживается `simple_dir_operations` (dcache_readdir): он
 перечисляет дочерние dentry каталога. Содержимое файлов генерируется на лету в
 `u235fs_read()` через `simple_read_from_buffer()`.
+
+Операция `.setattr` реализована собственным обработчиком `u235fs_setattr()`,
+который удаляет флаг `ATTR_SIZE` из запроса перед передачей в `simple_setattr()`.
+Это позволяет корректно обрабатывать открытие файлов с флагом `O_TRUNC` (например,
+через `tee`), не допуская вызова `truncate_setsize()` на виртуальных inodes без
+page cache.
 
 ## 5. Запуск/пауза через `RAM`
 
@@ -100,8 +115,12 @@ struct u235_sim {
 сделало бы кривую распада противоречивой. Поэтому при первом `create(RAM)`
 выставляется `params_locked=true`, и `u235fs_write()` для `PARAMS` возвращает
 `-EPERM`, пока ФС смонтирована. До первого `RAM` запись разрешена и парсит строки
-`key=value` (`strsep`/`strim`/`kstrtol`; частота — через `parse_double` внутри
-FPU-региона с конвертацией в `freq_milli`).
+`key=value` (`strsep`/`strim`/`kstrtol`; частота — через `parse_double` вне
+mutex'а, в FPU-регионе с конвертацией в `freq_milli`).
+
+Важная особенность: `kernel_fpu_begin()` вызывается **вне** `mutex_lock`, поскольку
+на ядрах с `PREEMPT_RT` mutex является спящей блокировкой, а `kernel_fpu_begin()`
+не допускает вызова из спящего контекста.
 
 ## 7. Периодическое обновление (`delayed_work`)
 
@@ -150,9 +169,35 @@ FPU-региона с конвертацией в `freq_milli`).
 * `parse_double()` — разбор строки в `double`.
 
 Все эти функции вызываются строго внутри `kernel_fpu_begin()/kernel_fpu_end()`.
-Объект собирается с `-msse -msse2 -mpreferred-stack-boundary=4
--fno-tree-vectorize` (см. Makefile), так как ядро отключает SSE глобально. Модуль
-ориентирован на x86_64.
+Объект собирается с флагами (см. Makefile):
+
+```
+-msse -msse2 -mpreferred-stack-boundary=3 -fno-tree-vectorize -mno-sse4
+```
+
+Флаги `-msse -msse2` включают поддержку SSE2 для `double`-арифметики. Флаг
+`-mpreferred-stack-boundary=3` задаёт выравнивание стека по 8 байт, совпадающее с
+требованиями ядра (`-mpreferred-stack-boundary=3` используется и самим ядром).
+Значение `4` (16 байт) недопустимо: компилятор генерирует инструкции `movaps`,
+требующие 16-байтного выравнивания, но ядро гарантирует выровненность стека только
+по 8 байтам — это приводит к `#GP` fault при вызове функций модуля. Флаг
+`-fno-tree-vectorize` запрещает автовекторизацию циклов, `-mno-sse4` исключает
+инструкции SSE4. Модуль ориентирован на x86_64.
+
+### Совместимость с версиями ядра
+
+Модуль поддерживает ядра 5.15 — 7.x. Версионные развилки через `LINUX_VERSION_CODE`:
+
+| Версия | Изменение | Адаптация |
+|--------|-----------|-----------|
+| < 5.12 | `create()` без `user_namespace` | `#if` на сигнатуру |
+| 5.12+ | `create()` с `struct user_namespace *` | аналогично |
+| 6.3+  | `create()` с `struct mnt_idmap *`; `.setattr`/`.getattr` с idmap | версионные обёртки |
+| 6.6+  | `i_atime`/`i_mtime`/`i_ctime` стали приватными | `inode_set_*_to_ts()` хелперы |
+| 6.8+  | `mount_nodev`/`.mount` убраны | `get_tree_nodev`/`.init_fs_context` |
+| 6.8+  | `kill_litter_super` убран | `kill_anon_super` |
+| 6.8+  | `generic_delete_inode` убран из публичного API | убран из `.drop_inode` |
+| 6.11+ | `simple_inode_init_ts()` убрана | прямые хелперы `inode_set_*_to_ts()` |
 
 ## 10. demo.sh и test.sh
 
