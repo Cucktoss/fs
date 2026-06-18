@@ -15,7 +15,7 @@
 obj-m += u235fs.o
 u235fs-y := src/u235fs.o
 
-CFLAGS_src/u235fs.o += -msse -msse2 -mpreferred-stack-boundary=4 -fno-tree-vectorize
+CFLAGS_src/u235fs.o += -msse -msse2 -mpreferred-stack-boundary=3 -fno-tree-vectorize -mno-sse4
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
