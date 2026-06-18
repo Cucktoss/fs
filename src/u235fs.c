@@ -43,6 +43,9 @@
 #include <linux/dcache.h>
 #include <linux/kstrtox.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+#include <linux/fs_context.h>
+#endif
 
 #include <asm/fpu/api.h>   /* kernel_fpu_begin()/kernel_fpu_end() (x86) */
 
@@ -419,7 +422,19 @@ static void u235fs_tick(struct work_struct *w)
 static inline void u235fs_set_times(struct inode *inode)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-	simple_inode_init_ts(inode);
+	/*
+	 * 6.6+: i_atime, i_mtime, i_ctime fields became private.
+	 * Use the dedicated accessor helpers for all three timestamps.
+	 * simple_inode_init_ts() existed only in 6.6-6.10 and was removed
+	 * in 6.11 when ctime storage changed again, so we avoid it entirely
+	 * and call the lower-level helpers that work across all 6.6+ kernels.
+	 */
+	{
+		struct timespec64 now = current_time(inode);
+		inode_set_atime_to_ts(inode, now);
+		inode_set_mtime_to_ts(inode, now);
+		inode_set_ctime_to_ts(inode, now);
+	}
 #else
 	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
 #endif
@@ -655,10 +670,14 @@ static ssize_t u235fs_write(struct file *file, const char __user *ubuf,
 			have_freq = true;
 		}
 	}
+	mutex_unlock(&sim->lock);
 
 	if (have_freq) {
 		long milli;
 
+		/* kernel_fpu_begin() must NOT be called while holding a
+		 * sleeping lock (mutex). Parse frequency after releasing it,
+		 * then re-acquire only to commit the result. */
 		kernel_fpu_begin();
 		{
 			double f = parse_double(freqbuf);
@@ -668,9 +687,11 @@ static ssize_t u235fs_write(struct file *file, const char __user *ubuf,
 			milli = (long)(f * 1000.0 + 0.5);
 		}
 		kernel_fpu_end();
+
+		mutex_lock(&sim->lock);
 		sim->freq_milli = milli;
+		mutex_unlock(&sim->lock);
 	}
-	mutex_unlock(&sim->lock);
 
 	kfree(kbuf);
 	return len;
@@ -747,9 +768,55 @@ static int u235fs_unlink(struct inode *dir, struct dentry *dentry)
 	return simple_unlink(dir, dentry);
 }
 
+
 /* ======================================================================= */
-/* Ops tables                                                               */
+/* setattr: accept permission/time changes, silently ignore size/truncate  */
+/* getattr: left to VFS default (NULL = generic_fillattr equivalent)       */
 /* ======================================================================= */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int u235fs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			  struct iattr *attr)
+{
+	/*
+	 * Our virtual files have no page cache and no backing store, so
+	 * truncation is meaningless. Drop ATTR_SIZE from the request and
+	 * let setattr_copy handle the rest (times, permissions).
+	 * This prevents do_truncate() → truncate_setsize() from crashing
+	 * on kernels 6.11+ where the truncate path changed.
+	 */
+	attr->ia_valid &= ~ATTR_SIZE;
+	if (!attr->ia_valid)
+		return 0;
+	return simple_setattr(idmap, dentry, attr);
+}
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+static int u235fs_setattr(struct user_namespace *mnt_userns,
+			  struct dentry *dentry, struct iattr *attr)
+{
+	attr->ia_valid &= ~ATTR_SIZE;
+	if (!attr->ia_valid)
+		return 0;
+	return simple_setattr(mnt_userns, dentry, attr);
+}
+#else
+static int u235fs_setattr(struct dentry *dentry, struct iattr *attr)
+{
+	attr->ia_valid &= ~ATTR_SIZE;
+	if (!attr->ia_valid)
+		return 0;
+	return simple_setattr(dentry, attr);
+}
+#endif
+
+static int u235fs_open(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+
+
+
 
 static const struct inode_operations u235fs_dir_inode_ops = {
 	.lookup	= simple_lookup,
@@ -757,14 +824,17 @@ static const struct inode_operations u235fs_dir_inode_ops = {
 	.unlink	= u235fs_unlink,
 };
 
+/*
+ * .setattr strips ATTR_SIZE so tee's O_TRUNC never reaches truncate_setsize.
+ * .getattr is left NULL — VFS falls back to a safe generic path.
+ */
 static const struct inode_operations u235fs_file_inode_ops = {
-	.setattr = simple_setattr,
-	.getattr = simple_getattr,
+	.setattr = u235fs_setattr,
 };
 
 static const struct file_operations u235fs_file_ops = {
 	.owner		= THIS_MODULE,
-	.open		= simple_open,
+	.open		= u235fs_open,
 	.read		= u235fs_read,
 	.write		= u235fs_write,
 	.llseek		= default_llseek,
@@ -772,17 +842,28 @@ static const struct file_operations u235fs_file_ops = {
 
 static const struct super_operations u235fs_super_ops = {
 	.statfs		= simple_statfs,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	.drop_inode	= generic_delete_inode,
+#endif
 };
+
+
 
 /* ======================================================================= */
 /* Super block lifecycle                                                    */
 /* ======================================================================= */
 
-static int u235fs_fill_super(struct super_block *sb, void *data, int silent)
+/*
+ * fill_super is called with different signatures depending on whether we go
+ * through the old .mount path (pre-6.8) or the new .init_fs_context path
+ * (6.8+).  Keep a single implementation and adapt the callers below.
+ */
+static int u235fs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct u235_sim *sim;
 	struct inode *root;
+
+	(void)fc; /* fs_private unused; all config comes from PARAMS file */
 
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
@@ -829,10 +910,24 @@ static int u235fs_fill_super(struct super_block *sb, void *data, int silent)
 	return 0;
 }
 
-static struct dentry *u235fs_mount(struct file_system_type *fst, int flags,
-				   const char *dev, void *data)
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+
+/* --- new init_fs_context API (6.8+) --------------------------------------- */
+
+static int u235fs_get_tree(struct fs_context *fc)
 {
-	return mount_nodev(fst, flags, data, u235fs_fill_super);
+	return get_tree_nodev(fc, u235fs_fill_super);
+}
+
+static const struct fs_context_operations u235fs_ctx_ops = {
+	.get_tree = u235fs_get_tree,
+};
+
+static int u235fs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &u235fs_ctx_ops;
+	return 0;
 }
 
 static void u235fs_kill_sb(struct super_block *sb)
@@ -842,8 +937,46 @@ static void u235fs_kill_sb(struct super_block *sb)
 	if (sim)
 		cancel_delayed_work_sync(&sim->dwork);
 
-	kill_litter_super(sb);	/* drops all pinned dentries/inodes */
-	kfree(sim);		/* kfree(NULL) is safe */
+	kill_anon_super(sb);
+	kfree(sim);
+}
+
+static struct file_system_type u235fs_type = {
+	.owner			= THIS_MODULE,
+	.name			= "u235fs",
+	.init_fs_context	= u235fs_init_fs_context,
+	.kill_sb		= u235fs_kill_sb,
+	.fs_flags		= 0,
+};
+
+#else /* kernels < 6.8: classic .mount API ---------------------------------- */
+
+static int u235fs_fill_super_legacy(struct super_block *sb, void *data,
+				    int silent)
+{
+	/*
+	 * Bridge the old three-argument signature to our implementation.
+	 * We pass NULL for fc since u235fs_fill_super ignores it entirely
+	 * (all configuration happens through the PARAMS virtual file).
+	 */
+	return u235fs_fill_super(sb, NULL);
+}
+
+static struct dentry *u235fs_mount(struct file_system_type *fst, int flags,
+				   const char *dev, void *data)
+{
+	return mount_nodev(fst, flags, data, u235fs_fill_super_legacy);
+}
+
+static void u235fs_kill_sb(struct super_block *sb)
+{
+	struct u235_sim *sim = sb->s_fs_info;
+
+	if (sim)
+		cancel_delayed_work_sync(&sim->dwork);
+
+	kill_litter_super(sb);
+	kfree(sim);
 }
 
 static struct file_system_type u235fs_type = {
@@ -853,6 +986,9 @@ static struct file_system_type u235fs_type = {
 	.kill_sb	= u235fs_kill_sb,
 	.fs_flags	= 0,
 };
+
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0) */
+
 
 /* ======================================================================= */
 /* Module init/exit                                                         */
